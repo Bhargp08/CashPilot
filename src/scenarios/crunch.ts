@@ -23,6 +23,12 @@ export const crunchScenario: BusinessState = {
     { id: "in_acme", payer: "Acme Corp", amount: 1_500_000, currency: "USD", expectedDate: "2026-11-09", confidence: 0.8 },
     { id: "in_globex", payer: "Globex GmbH", amount: 700_000, currency: "EUR", expectedDate: "2026-11-12", confidence: 0.6 },
   ],
+  otherAssets: [
+    { id: "as_sav", name: "High-yield savings", kind: "savings", value: 2_500_000, currency: "USD", daysToCash: 1, costBps: 0, costNote: "No fee. Lands next business day." },
+    { id: "as_tbill", name: "Treasury bills", kind: "treasuries", value: 1_500_000, currency: "USD", daysToCash: 2, costBps: 5, costNote: "About 0.05% selling spread." },
+    { id: "as_brk", name: "Brokerage (index funds)", kind: "brokerage", value: 4_230_000, currency: "USD", daysToCash: 2, costBps: 320, costNote: "Estimated 3.2% tax on gains, taken from proceeds." },
+    { id: "as_roth", name: "Roth IRA (personal)", kind: "roth_ira", value: 1_860_000, currency: "USD", daysToCash: 5, costBps: 3400, freeAmount: 1_100_000, restricted: true, costNote: "Contributions up to $11,000 come out free. Beyond that, about 34% in penalty and tax." },
+  ],
   policy: {
     reserveFloor: { amount: 200_000, currency: "USD" },
     neverAutoDefer: ["payroll", "tax"],

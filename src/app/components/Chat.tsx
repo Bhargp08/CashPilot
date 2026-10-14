@@ -10,7 +10,7 @@ interface Msg {
   tool?: string;
 }
 
-const SUGGESTIONS = ["What if Acme pays 5 days late?", "Why defer rent?", "Approve Kessler", "Reset"];
+const SUGGESTIONS = ["What if Acme pays 5 days late?", "Cover Northwind from savings", "Where can I move $9,000 from?", "Why defer rent?", "Reset"];
 
 export default function Chat({ ctx, onEffect, intro }: { ctx: Ctx; onEffect: (e: Effect) => void; intro: string }) {
   const [msgs, setMsgs] = useState<Msg[]>([{ id: 0, role: "ai", text: intro }]);

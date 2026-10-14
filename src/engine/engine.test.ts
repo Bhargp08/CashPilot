@@ -93,3 +93,39 @@ describe("MockBank", () => {
     expect(no.ok).toBe(false);
   });
 });
+
+import { fundingOptions, neededFunding, transferInflow } from "./index";
+
+describe("funding", () => {
+  it("covers a $9,000 need for free from savings, Roth last", () => {
+    const a = fundingOptions(s, 900_000, "2026-11-04");
+    expect(a.mix).toHaveLength(1);
+    expect(a.mix[0].assetId).toBe("as_sav");
+    expect(a.mixCost).toBe(0);
+    expect(a.mixCoversNeed).toBe(true);
+    expect(a.options[a.options.length - 1].assetId).toBe("as_roth");
+  });
+  it("only uses Roth when nothing else can close the gap, and charges the penalty above contributions", () => {
+    const a = fundingOptions(s, 12_000_000, "2026-11-10");
+    expect(a.mix.map((o) => o.assetId)).toContain("as_roth");
+    const roth = a.mix.find((o) => o.assetId === "as_roth")!;
+    expect(roth.cost).toBeGreaterThan(0);
+    expect(roth.cost).toBeLessThan(roth.amount * 0.34 + 1);
+  });
+  it("flags a source that arrives too late", () => {
+    const a = fundingOptions(s, 900_000, "2026-11-03");
+    expect(a.options.find((o) => o.assetId === "as_brk")!.inTime).toBe(false);
+  });
+  it("computes the need from a forecast", () => {
+    const bad = forecast(s, 14);
+    const n = neededFunding(s, bad.days);
+    expect(n.need).toBeGreaterThan(0);
+    const good = forecast(applyDecisions(s, goodPlan), 14);
+    expect(neededFunding(s, good.days).need).toBe(0);
+  });
+  it("turns a transfer into a net-of-cost inflow", () => {
+    const i = transferInflow(s, "as_brk", 1_000_000)!;
+    expect(i.amount).toBe(1_000_000 - 32_000);
+    expect(i.expectedDate).toBe("2026-11-04");
+  });
+});

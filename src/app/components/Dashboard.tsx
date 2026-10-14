@@ -2,11 +2,14 @@
 
 import { useMemo, useState } from "react";
 import type { BusinessState, Currency, Decision, Plan } from "@/contracts/types";
-import { engine } from "@/engine";
-import { addDays } from "@/engine/util";
+import { engine, neededFunding, transferInflow } from "@/engine";
+import { addDays, convertAmount } from "@/engine/util";
 import type { Effect } from "../lib/assistant";
 import { humanize, money, shortDate } from "../lib/format";
+import AssetsPage from "./AssetsPage";
 import Chat from "./Chat";
+import MovePage from "./MovePage";
+import TopBar, { type Page } from "./TopBar";
 import Timeline, { VerbGlyph, type Marker, type Verb } from "./Timeline";
 
 type Tab = Currency | "Total";
@@ -20,6 +23,9 @@ export default function Dashboard({ state: base, plan }: { state: BusinessState;
   const [open, setOpen] = useState<string | null>(null);
   const [resolved, setResolved] = useState<Record<string, "approved" | "rejected">>({});
   const [delays, setDelays] = useState<Record<string, number>>({});
+  const [page, setPage] = useState<Page>("overview");
+  const [transfers, setTransfers] = useState<Record<string, number>>({});
+  const [target, setTarget] = useState<{ amount: number; by: string } | null>(null);
 
   const scenario = useMemo(() => {
     const s = structuredClone(base);
@@ -27,14 +33,23 @@ export default function Dashboard({ state: base, plan }: { state: BusinessState;
     return s;
   }, [base, delays]);
 
-  const { before, after, violations } = useMemo(
-    () => ({
+  const { before, after, violations, need, lowestAfter } = useMemo(() => {
+    const planned = plan.decisions.filter((d) => !(d.action === "escalate" && d.obligationId && resolved[d.obligationId] === "approved"));
+    const planState = engine.applyDecisions(scenario, planned);
+    const withTransfers = {
+      ...planState,
+      inflows: [...planState.inflows, ...Object.entries(transfers).map(([id, amt]) => transferInflow(scenario, id, amt)).filter((i) => i !== null)],
+    };
+    const cur = scenario.policy.reserveFloor.currency;
+    const afterFc = engine.forecast(withTransfers, HORIZON);
+    return {
       before: engine.forecast(scenario, HORIZON),
-      after: engine.forecast(engine.applyDecisions(scenario, plan.decisions), HORIZON),
+      after: afterFc,
       violations: engine.validate(scenario, plan.decisions),
-    }),
-    [scenario, plan],
-  );
+      need: neededFunding(scenario, engine.forecast(planState, HORIZON).days),
+      lowestAfter: Math.min(...afterFc.days.map((d) => d.balances[cur] ?? 0)),
+    };
+  }, [scenario, plan, resolved, transfers]);
 
   const floorCur = base.policy.reserveFloor.currency;
   const currencies = Array.from(new Set(base.balances.map((b) => b.currency)));
@@ -66,31 +81,67 @@ export default function Dashboard({ state: base, plan }: { state: BusinessState;
   const markerId = (d: Decision) => `d${plan.decisions.indexOf(d)}`;
 
   const rows = [
-    ...base.obligations.map((o) => ({ kind: "out" as const, id: o.id, date: o.dueDate, name: o.payee, sub: o.category, amount: o.amount, cur: o.currency })),
+    ...base.obligations.map((o) => ({ kind: "out" as const, id: o.id, date: o.dueDate, name: o.payee, sub: o.category[0].toUpperCase() + o.category.slice(1), amount: o.amount, cur: o.currency })),
     ...scenario.inflows.map((i) => ({ kind: "in" as const, id: i.id, date: i.expectedDate, name: i.payer, sub: `${Math.round(i.confidence * 100)}% likely${delays[i.id] ? `, ${delays[i.id]} days late` : ""}`, amount: i.amount, cur: i.currency })),
   ].sort((x, y) => x.date.localeCompare(y.date));
 
   function apply(e: Effect) {
     if (e.type === "reset") setDelays({});
     else if (e.type === "delay") setDelays((d) => ({ ...d, [e.inflowId]: e.days }));
-    else setResolved((r) => ({ ...r, [e.obligationId]: e.status }));
+    else if (e.type === "navigate") {
+      setPage(e.page);
+      if (e.amount != null && e.by) setTarget({ amount: e.amount, by: e.by });
+    } else if (e.type === "transfer") {
+      setTransfers((t) => ({ ...t, [e.assetId]: e.amount }));
+      setTarget({ amount: e.amount, by: e.by });
+      setPage("move");
+    } else setResolved((r) => ({ ...r, [e.obligationId]: e.status }));
   }
 
   const asks = plan.decisions.filter((d): d is Extract<Decision, { action: "escalate" }> => d.action === "escalate");
   const pending = asks.filter((d) => d.obligationId && !resolved[d.obligationId]).length;
-  const ctx = { state: scenario, baseState: base, plan };
+  const ctx = { state: scenario, baseState: base, plan, resolved };
+  const cur0 = base.policy.reserveFloor.currency;
+  const askChips = asks
+    .map((d) => ob(d.obligationId))
+    .filter((o): o is NonNullable<typeof o> => !!o)
+    .map((o) => ({ label: `Pay ${o.payee} on time`, amount: convertAmount(base, o.amount, o.currency, cur0), by: o.dueDate }));
+  const moveTarget = target ?? (need.need > 0 ? { amount: need.need, by: need.by } : { amount: 0, by: base.asOf });
+  const otherAssets = base.otherAssets ?? [];
+  const cashTotal = base.balances.reduce((sum, bal) => sum + convertAmount(base, bal.available, bal.currency, base.baseCurrency), 0);
+  const chipsTop = [
+    { id: "sav", label: "Savings", kinds: ["savings", "treasuries"] },
+    { id: "inv", label: "Investments", kinds: ["brokerage"] },
+    { id: "ret", label: "Roth IRA", kinds: ["roth_ira"] },
+  ]
+    .map((g) => ({ id: g.id, label: g.label, value: otherAssets.filter((x) => g.kinds.includes(x.kind)).reduce((sum, x) => sum + convertAmount(base, x.value, x.currency, base.baseCurrency), 0) }))
+    .filter((g) => g.value > 0);
   const intro = first
     ? `${money(first.gap, first.currency)} short on ${shortDate(first.date)}. I have a plan: ${plan.summary} ${pending} item${pending === 1 ? "" : "s"} need${pending === 1 ? "s" : ""} your call.`
     : "Cash covers everything in the next 14 days.";
 
   return (
     <div className="app">
+      <TopBar page={page} onPage={setPage} cash={cashTotal} chips={chipsTop} currency={base.baseCurrency} moveBadge={need.need} asOf={shortDate(base.asOf)} />
+      <div className="body">
       <main className="main">
-        <header className="top">
-          <div className="brand">CashPilot</div>
-          <div className="asof">Demo business · {shortDate(base.asOf)}</div>
-        </header>
-
+        {page === "assets" && <AssetsPage state={scenario} onMove={() => setPage("move")} />}
+        {page === "move" && (
+          <MovePage
+            key={`${moveTarget.amount}-${moveTarget.by}`}
+            state={scenario}
+            need={need.need}
+            needBy={need.by}
+            amount={moveTarget.amount}
+            by={moveTarget.by}
+            setTarget={(amount, by) => setTarget({ amount, by })}
+            transfers={transfers}
+            onTransfer={(id, amt) => setTransfers((t) => { const n = { ...t }; if (amt == null) delete n[id]; else n[id] = amt; return n; })}
+            chips={askChips}
+            lowestAfter={lowestAfter}
+          />
+        )}
+        {page === "overview" && (<>
         <section className="hero">
           <div className="hero-label">{tab === "Total" ? `Total cash (${unit})` : `${unit} available`}</div>
           <div className="hero-num">{money(lead[idx], unit)}</div>
@@ -137,6 +188,12 @@ export default function Dashboard({ state: base, plan }: { state: BusinessState;
             </label>
           </div>
         </section>
+
+        {need.need > 0 && (
+          <button className="banner" onClick={() => setPage("move")}>
+            You would be {money(need.need, cur0)} short of your reserve by {shortDate(need.by)}. See ways to move money
+          </button>
+        )}
 
         {asks.length > 0 && (
           <section aria-label="Needs approval">
@@ -232,9 +289,11 @@ export default function Dashboard({ state: base, plan }: { state: BusinessState;
             <li><div className="row static"><span className="r-main"><b>Max currency fee</b></span><span className="r-end"><b>{(base.policy.maxFxSpreadBps / 100).toFixed(2)}%</b></span></div></li>
           </ul>
         </section>
+        </>)}
       </main>
 
       <Chat ctx={ctx} onEffect={apply} intro={intro} />
+      </div>
     </div>
   );
 }
