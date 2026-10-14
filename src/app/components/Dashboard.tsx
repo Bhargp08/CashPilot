@@ -1,174 +1,240 @@
 "use client";
 
-import { useState } from "react";
-import type { AuditEntry, BusinessState, Decision, Forecast, Plan } from "@/contracts/types";
-import { money, shortDate } from "../lib/format";
+import { useMemo, useState } from "react";
+import type { BusinessState, Currency, Decision, Plan } from "@/contracts/types";
+import { engine } from "@/engine";
+import { addDays } from "@/engine/util";
+import type { Effect } from "../lib/assistant";
+import { humanize, money, shortDate } from "../lib/format";
+import Chat from "./Chat";
 import Timeline, { VerbGlyph, type Marker, type Verb } from "./Timeline";
 
-interface Props {
-  state: BusinessState;
-  before: Forecast;
-  plan: Plan;
-  audit: AuditEntry[];
-  violations: string[];
-}
+type Tab = Currency | "Total";
+const HORIZON = 14;
 
-const VERB_LABEL: Record<Verb, string> = { fund: "Pay", convert: "Convert", defer: "Move", escalate: "Your call" };
-
-export default function Dashboard({ state, before, plan, audit, violations }: Props) {
+export default function Dashboard({ state: base, plan }: { state: BusinessState; plan: Plan }) {
   const [showPlan, setShowPlan] = useState(true);
+  const [tab, setTab] = useState<Tab>(base.policy.reserveFloor.currency);
+  const [hover, setHover] = useState<number | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
   const [resolved, setResolved] = useState<Record<string, "approved" | "rejected">>({});
+  const [delays, setDelays] = useState<Record<string, number>>({});
 
-  const floorCur = state.policy.reserveFloor.currency;
-  const ob = (id?: string) => state.obligations.find((o) => o.id === id);
+  const scenario = useMemo(() => {
+    const s = structuredClone(base);
+    for (const i of s.inflows) if (delays[i.id]) i.expectedDate = addDays(i.expectedDate, delays[i.id]);
+    return s;
+  }, [base, delays]);
 
-  const items = plan.decisions.map((d, i) => {
-        const o = "obligationId" in d ? ob(d.obligationId) : undefined;
-        let title = "";
-        let date: string = state.asOf;
-        if (d.action === "fund") {
-          title = `Pay ${o?.payee} ${o ? money(o.amount, o.currency) : ""}`;
-          date = o?.dueDate ?? date;
-        } else if (d.action === "convert") {
-          title = `Convert ${money(d.sellAmount, d.from)} to ${d.to}`;
-        } else if (d.action === "defer") {
-          title = `Move ${o?.payee} to ${shortDate(d.newDate)}`;
-          date = d.newDate;
-        } else {
-          title = `Ask you about ${o?.payee ?? "this payment"}`;
-          date = o?.dueDate ?? date;
-        }
-        return { id: `d${i}`, i, d, title, date, verb: d.action as Verb, o };
-      });
+  const { before, after, violations } = useMemo(
+    () => ({
+      before: engine.forecast(scenario, HORIZON),
+      after: engine.forecast(engine.applyDecisions(scenario, plan.decisions), HORIZON),
+      violations: engine.validate(scenario, plan.decisions),
+    }),
+    [scenario, plan],
+  );
 
-  const markers: Marker[] = items.map((x) => ({ id: x.id, date: x.date, verb: x.verb, label: x.title }));
+  const floorCur = base.policy.reserveFloor.currency;
+  const currencies = Array.from(new Set(base.balances.map((b) => b.currency)));
+  const series = (days: typeof before.days) => days.map((d) => (tab === "Total" ? d.totalInBase : (d.balances[tab] ?? 0)));
+  const dates = before.days.map((d) => d.date);
+  const b = series(before.days);
+  const a = series(after.days);
+  const unit: Currency = tab === "Total" ? base.baseCurrency : tab;
+  const idx = hover ?? 0;
+  const lead = showPlan ? a : b;
+  const delta = lead[idx] - lead[0];
   const first = before.shortfalls[0];
-  const escalations = items.filter((x) => x.verb === "escalate");
-  const counts = (v: Verb) => items.filter((x) => x.verb === v).length;
-  const open = escalations.filter((e) => !resolved[e.id]).length;
+  const ob = (id?: string) => scenario.obligations.find((o) => o.id === id) ?? base.obligations.find((o) => o.id === id);
+
+  const decisionOf = (id: string): Decision | undefined => plan.decisions.find((d) => "obligationId" in d && d.obligationId === id);
+  const title = (d: Decision) => {
+    const o = "obligationId" in d ? ob(d.obligationId) : undefined;
+    if (d.action === "convert") return `Convert ${money(d.sellAmount, d.from)} to ${d.to}`;
+    if (d.action === "fund") return `Pay ${o?.payee}`;
+    if (d.action === "defer") return `Move ${o?.payee} to ${shortDate(d.newDate)}`;
+    return `Ask you about ${o?.payee}`;
+  };
+  const dateOf = (d: Decision) => {
+    if (d.action === "convert") return base.asOf;
+    if (d.action === "defer") return d.newDate;
+    return ob(d.obligationId)?.dueDate ?? base.asOf;
+  };
+  const markers: Marker[] = plan.decisions.map((d, i) => ({ id: `d${i}`, date: dateOf(d), verb: d.action as Verb, label: title(d) }));
+  const markerId = (d: Decision) => `d${plan.decisions.indexOf(d)}`;
+
+  const rows = [
+    ...base.obligations.map((o) => ({ kind: "out" as const, id: o.id, date: o.dueDate, name: o.payee, sub: o.category, amount: o.amount, cur: o.currency })),
+    ...scenario.inflows.map((i) => ({ kind: "in" as const, id: i.id, date: i.expectedDate, name: i.payer, sub: `${Math.round(i.confidence * 100)}% likely${delays[i.id] ? `, ${delays[i.id]} days late` : ""}`, amount: i.amount, cur: i.currency })),
+  ].sort((x, y) => x.date.localeCompare(y.date));
+
+  function apply(e: Effect) {
+    if (e.type === "reset") setDelays({});
+    else if (e.type === "delay") setDelays((d) => ({ ...d, [e.inflowId]: e.days }));
+    else setResolved((r) => ({ ...r, [e.obligationId]: e.status }));
+  }
+
+  const asks = plan.decisions.filter((d): d is Extract<Decision, { action: "escalate" }> => d.action === "escalate");
+  const pending = asks.filter((d) => d.obligationId && !resolved[d.obligationId]).length;
+  const ctx = { state: scenario, baseState: base, plan };
+  const intro = first
+    ? `${money(first.gap, first.currency)} short on ${shortDate(first.date)}. I have a plan: ${plan.summary} ${pending} item${pending === 1 ? "" : "s"} need${pending === 1 ? "s" : ""} your call.`
+    : "Cash covers everything in the next 14 days.";
 
   return (
-    <main className="shell">
-      <header className="top">
-        <div className="brand">CashPilot</div>
-        <div className="asof">Demo business · cash as of {shortDate(state.asOf)}</div>
-      </header>
+    <div className="app">
+      <main className="main">
+        <header className="top">
+          <div className="brand">CashPilot</div>
+          <div className="asof">Demo business · {shortDate(base.asOf)}</div>
+        </header>
 
-      <section className="verdict">
-        <h1>
-          {first
-            ? `${money(first.gap, first.currency)} short on ${shortDate(first.date)}: ${ob(first.blockedObligationIds[0])?.payee ?? "a bill"} can't be paid from the ${first.currency} account${first.coveredByOtherCurrencies ? ", but the money exists in another currency." : "."}`
-            : "Cash covers every payment in the next 14 days."}
-        </h1>
-        <p>
-          The plan converts {counts("convert")} balance, pays {counts("fund")} bill, moves {counts("defer")} to later dates and needs
-          your decision on {counts("escalate")}.
-        </p>
-        {violations.length > 0 && (
-          <p className="alert" role="alert">
-            This plan breaks your policy: {violations.join(" ")}
-          </p>
-        )}
-      </section>
-
-      <section className="chart" aria-label="Cash timeline">
-        <div className="chart-head">
-          <h2>Next 14 days</h2>
-          <label className="toggle">
-            <input type="checkbox" checked={showPlan} onChange={(e) => setShowPlan(e.target.checked)} />
-            Show the plan
-          </label>
-        </div>
-        <Timeline
-          currency={floorCur}
-          floor={state.policy.reserveFloor.amount}
-          before={before.days}
-          after={plan.resultingForecast.days}
-          markers={markers}
-          selectedId={selected}
-          onSelect={setSelected}
-          showPlan={showPlan}
-        />
-      </section>
-
-      <div className="cols">
-        <section aria-label="Plan">
-          <h2>What CashPilot will do</h2>
-          <ol className="steps">
-            {items
-              .filter((x) => x.verb !== "escalate")
-              .map((x) => {
-                const a = audit[x.i];
-                return (
-                  <li key={x.id} className={`step ${selected === x.id ? "on" : ""}`} style={{ ["--c" as string]: `var(--${x.verb})` }} onClick={() => setSelected(selected === x.id ? null : x.id)}>
-                    <div className="step-head">
-                      <VerbGlyph verb={x.verb} />
-                      <span className="verb">{VERB_LABEL[x.verb]}</span>
-                      <span className="when">{shortDate(x.date)}</span>
-                    </div>
-                    <div className="step-title">{x.title}</div>
-                    <p>{x.d.reason}</p>
-                    <details onClick={(e) => e.stopPropagation()}>
-                      <summary>What this is based on</summary>
-                      <ul className="based">
-                        {a.basedOn.obligationIds.map((id) => <li key={id}>Bill: {ob(id)?.payee}</li>)}
-                        {a.basedOn.balanceAccountIds.map((id) => <li key={id}>Account: {id.replace("acc_", "").toUpperCase()}</li>)}
-                        {a.basedOn.policyRules.map((r) => <li key={r}>Policy: {r}</li>)}
-                        {a.policyViolations.length === 0 && <li>Passes all policy checks</li>}
-                      </ul>
-                    </details>
-                  </li>
-                );
-              })}
-          </ol>
+        <section className="hero">
+          <div className="hero-label">{tab === "Total" ? `Total cash (${unit})` : `${unit} available`}</div>
+          <div className="hero-num">{money(lead[idx], unit)}</div>
+          <div className={`hero-delta ${delta < 0 ? "down" : delta > 0 ? "up" : ""}`}>
+            {delta === 0 ? "Today" : `${delta < 0 ? "▼" : "▲"} ${money(Math.abs(delta), unit)}`}
+            <span className="hero-when"> {idx === 0 ? "" : `by ${shortDate(dates[idx])}`}</span>
+          </div>
+          {first && (
+            <div className={`pill ${showPlan && violations.length === 0 ? "ok" : "bad"}`} role="status">
+              {showPlan && violations.length === 0
+                ? `Plan covers the ${money(first.gap, first.currency)} gap on ${shortDate(first.date)}`
+                : violations.length
+                  ? `Plan needs a re-plan: ${humanize(violations[0])}`
+                  : `Short ${money(first.gap, first.currency)} on ${shortDate(first.date)} with no action`}
+            </div>
+          )}
         </section>
 
-        <section aria-label="Needs your decision">
-          <h2>
-            Needs your call {open > 0 && <span className="count">{open}</span>}
-          </h2>
-          {escalations.length === 0 && <p className="empty">Nothing needs a human right now.</p>}
-          <ul className="asks">
-            {escalations.map((x) => {
-              const d = x.d as Extract<Decision, { action: "escalate" }>;
-              const r = resolved[x.id];
+        <section className="chart" aria-label="Cash timeline">
+          <Timeline
+            dates={dates}
+            before={b}
+            after={a}
+            currency={unit}
+            floor={tab === floorCur ? base.policy.reserveFloor.amount : null}
+            markers={markers}
+            showPlan={showPlan}
+            idx={idx}
+            onHover={setHover}
+            selectedId={selected}
+            onSelect={setSelected}
+          />
+          <div className="range">
+            <div className="tabs" role="tablist">
+              {[...currencies, "Total" as const].map((c) => (
+                <button key={c} role="tab" aria-selected={tab === c} className={tab === c ? "on" : ""} onClick={() => setTab(c)}>
+                  {c}
+                </button>
+              ))}
+            </div>
+            <label className="switch">
+              <input type="checkbox" checked={showPlan} onChange={(e) => setShowPlan(e.target.checked)} />
+              <span>Show plan</span>
+            </label>
+          </div>
+        </section>
+
+        {asks.length > 0 && (
+          <section aria-label="Needs approval">
+            <h2>Needs your approval {pending > 0 && <span className="count">{pending}</span>}</h2>
+            <div className="asks">
+              {asks.map((d) => {
+                const o = ob(d.obligationId);
+                const r = d.obligationId ? resolved[d.obligationId] : undefined;
+                return (
+                  <article key={d.obligationId} className={`ask ${selected === markerId(d) ? "sel" : ""}`}>
+                    <div className="ask-top">
+                      <VerbGlyph verb="escalate" />
+                      <strong>{o?.payee}</strong>
+                      <span className="amt">{o ? money(o.amount, o.currency) : ""}</span>
+                    </div>
+                    <p className="ask-q">{d.question}</p>
+                    <p className="why">{d.reason}</p>
+                    {r ? (
+                      <div className="done">
+                        {r === "approved" ? "Approved" : "Rejected"}
+                        <button className="link" onClick={() => setResolved((s) => { const n = { ...s }; delete n[d.obligationId!]; return n; })}>Undo</button>
+                      </div>
+                    ) : (
+                      <div className="btns">
+                        <button className="btn primary" onClick={() => setResolved((s) => ({ ...s, [d.obligationId!]: "approved" }))}>Approve payment</button>
+                        <button className="btn" onClick={() => setResolved((s) => ({ ...s, [d.obligationId!]: "rejected" }))}>Reject</button>
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        <section aria-label="Coming up">
+          <h2>Coming up</h2>
+          <ul className="list">
+            {plan.decisions.filter((d) => d.action === "convert").map((d) => (
+              <li key={markerId(d)} className={selected === markerId(d) ? "sel" : ""}>
+                <button className="row" onClick={() => setOpen(open === markerId(d) ? null : markerId(d))}>
+                  <span className="ico" style={{ background: "var(--convert)" }}><VerbGlyph verb="convert" size={14} /></span>
+                  <span className="r-main"><b>{title(d)}</b><small>Runs today</small></span>
+                  <span className="tag" style={{ ["--c" as string]: "var(--convert)" }}>Convert</span>
+                </button>
+                {open === markerId(d) && <p className="why indent">{d.reason}</p>}
+              </li>
+            ))}
+            {rows.map((r) => {
+              const d = r.kind === "out" ? decisionOf(r.id) : undefined;
+              const res = resolved[r.id];
+              const tag = d?.action === "fund" ? "Paid by plan" : d?.action === "defer" ? `Moves to ${shortDate(d.newDate)}` : d?.action === "escalate" ? (res ? (res === "approved" ? "Approved" : "Rejected") : "Needs approval") : r.kind === "in" ? "Expected" : "On schedule";
+              const verb = (d?.action ?? null) as Verb | null;
+              const mid = d ? markerId(d) : r.id;
               return (
-                <li key={x.id} className={`ask ${selected === x.id ? "on" : ""}`} onClick={() => setSelected(selected === x.id ? null : x.id)}>
-                  <div className="step-head">
-                    <VerbGlyph verb="escalate" />
-                    <span className="verb">{x.o?.payee}</span>
-                    <span className="when">{x.o ? money(x.o.amount, x.o.currency) : ""} due {x.o ? shortDate(x.o.dueDate) : ""}</span>
-                  </div>
-                  <div className="step-title">{d.question}</div>
-                  <p>{d.reason}</p>
-                  {r ? (
-                    <div className="resolved">
-                      {r === "approved" ? "Approved. This will be paid when the payment step is connected." : "Rejected. This stays unpaid."}{" "}
-                      <button className="link" onClick={(e) => { e.stopPropagation(); setResolved((s) => { const n = { ...s }; delete n[x.id]; return n; }); }}>
-                        Undo
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="actions">
-                      <button className="btn" onClick={(e) => { e.stopPropagation(); setResolved((s) => ({ ...s, [x.id]: "approved" })); }}>Approve payment</button>
-                      <button className="btn ghost" onClick={(e) => { e.stopPropagation(); setResolved((s) => ({ ...s, [x.id]: "rejected" })); }}>Reject</button>
-                    </div>
-                  )}
+                <li key={r.id} className={selected === mid ? "sel" : ""}>
+                  <button className="row" onClick={() => setOpen(open === mid ? null : mid)} aria-expanded={open === mid}>
+                    <span className="ico">{r.name[0]}</span>
+                    <span className="r-main"><b>{r.name}</b><small>{shortDate(r.date)} · {r.sub}</small></span>
+                    <span className="r-end">
+                      <b className={r.kind === "in" ? "up" : ""}>{r.kind === "in" ? "+" : ""}{money(r.amount, r.cur)}</b>
+                      <span className="tag" style={{ ["--c" as string]: verb ? `var(--${verb})` : "var(--muted)" }}>{tag}</span>
+                    </span>
+                  </button>
+                  {open === mid && d && <p className="why indent">{d.reason}</p>}
                 </li>
               );
             })}
           </ul>
-
-          <h2 className="policy-h">Your rules</h2>
-          <dl className="policy">
-            <div><dt>Keep at least</dt><dd>{money(state.policy.reserveFloor.amount, state.policy.reserveFloor.currency)} in {state.policy.reserveFloor.currency}</dd></div>
-            <div><dt>Never move</dt><dd>{state.policy.neverAutoDefer.join(", ")}</dd></div>
-            <div><dt>Ask me above</dt><dd>{money(state.policy.escalateAbove.amount, state.policy.escalateAbove.currency)}</dd></div>
-            <div><dt>Max currency fee</dt><dd>{(state.policy.maxFxSpreadBps / 100).toFixed(2)}%</dd></div>
-          </dl>
         </section>
-      </div>
-    </main>
+
+        <section aria-label="Accounts">
+          <h2>Accounts</h2>
+          <ul className="list">
+            {base.balances.map((x) => (
+              <li key={x.accountId}>
+                <div className="row static">
+                  <span className="ico">{x.currency}</span>
+                  <span className="r-main"><b>{x.currency} account</b><small>Available now</small></span>
+                  <span className="r-end"><b>{money(x.available, x.currency)}</b></span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+
+        <section aria-label="Your rules">
+          <h2>Your rules</h2>
+          <ul className="list">
+            <li><div className="row static"><span className="r-main"><b>Keep at least</b></span><span className="r-end"><b>{money(base.policy.reserveFloor.amount, floorCur)} in {floorCur}</b></span></div></li>
+            <li><div className="row static"><span className="r-main"><b>Never move</b></span><span className="r-end"><b>{base.policy.neverAutoDefer.join(", ")}</b></span></div></li>
+            <li><div className="row static"><span className="r-main"><b>Ask me above</b></span><span className="r-end"><b>{money(base.policy.escalateAbove.amount, base.policy.escalateAbove.currency)}</b></span></div></li>
+            <li><div className="row static"><span className="r-main"><b>Max currency fee</b></span><span className="r-end"><b>{(base.policy.maxFxSpreadBps / 100).toFixed(2)}%</b></span></div></li>
+          </ul>
+        </section>
+      </main>
+
+      <Chat ctx={ctx} onEffect={apply} intro={intro} />
+    </div>
   );
 }
