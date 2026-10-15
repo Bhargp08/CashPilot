@@ -11,113 +11,117 @@ import { planWithRules } from "./rules";
 let n = 0;
 const goodPlan = (): Plan => planWithRules(engine, { state: s, forecast: engine.forecast(s, 14) }, { newId: () => `plan_${++n}` });
 
-function spiedBank(bank = new MockBank()) {
-  return {
-    bank,
-    pay: vi.spyOn(bank, "payObligation"),
-    convert: vi.spyOn(bank, "convert"),
-    quote: vi.spyOn(bank, "quoteFx"),
-  };
+function spied(bank = new MockBank()) {
+  return { bank, pay: vi.spyOn(bank, "payObligation"), convert: vi.spyOn(bank, "convert"), quote: vi.spyOn(bank, "quoteFx") };
 }
 
 describe("execute", () => {
-  it("executes nothing when the plan has violations", async () => {
-    const { bank, pay, convert, quote } = spiedBank();
+  it("executes nothing when the plan has a violation", async () => {
+    const { bank, pay, convert, quote } = spied();
     const queue = new EscalationQueue();
-    const plan: Plan = { ...goodPlan(), decisions: [...goodPlan().decisions.filter((d) => !("obligationId" in d && d.obligationId === "ob_legal")), { action: "fund", obligationId: "ob_legal", reason: "x" }] };
-    const r = await execute(plan, bank, engine, { queue });
-    expect(r.ok).toBe(false);
+    const base = goodPlan();
+    const plan: Plan = { ...base, decisions: base.decisions.map((d) => ("obligationId" in d && d.obligationId === "ob_supplier" ? { action: "fund", obligationId: "ob_supplier", reason: "x" } : d)) };
+    const r = await execute(plan, bank, { queue, executeAll: true });
+    expect(r).toMatchObject({ executed: false, items: [] });
     expect(r.violations.join()).toMatch(/needsReview/);
     expect(pay).not.toHaveBeenCalled();
     expect(convert).not.toHaveBeenCalled();
     expect(quote).not.toHaveBeenCalled();
     expect(queue.list()).toEqual([]);
-    expect(r.outcomes.every((o) => o.status === "skipped")).toBe(true);
   });
 
-  it("runs the good plan: convert, pay payroll, record deferrals, queue escalations", async () => {
-    const { bank, pay, convert } = spiedBank();
+  it("leaves future-dated items scheduled unless executeAll", async () => {
+    const { bank, pay, convert, quote } = spied();
+    const queue = new EscalationQueue();
+    const r = await execute(goodPlan(), bank, { queue }); // now = asOf = Day 1: nothing is due yet
+    expect(r.executed).toBe(true);
+    expect(pay).not.toHaveBeenCalled();
+    expect(convert).not.toHaveBeenCalled();
+    expect(quote).not.toHaveBeenCalled();
+    const status = (a: string) => r.items.filter((i) => i.decision.action === a).map((i) => i.status);
+    expect(status("convert")).toEqual(["scheduled"]);
+    expect(status("fund")).toEqual(["scheduled", "scheduled", "scheduled"]);
+    expect(status("defer")).toEqual(["recorded"]);
+    expect(status("escalate")).toEqual(["awaiting_human"]);
+  });
+
+  it("runs what is due as days pass, and everything with executeAll", async () => {
+    const { bank, pay, convert } = spied();
     const queue = new EscalationQueue();
     const plan = goodPlan();
-    const r = await execute(plan, bank, engine, { queue });
-    expect(r.ok).toBe(true);
+    await execute(plan, bank, { queue, now: "2026-11-04" }); // Day 3: the conversion is due
     expect(convert).toHaveBeenCalledTimes(1);
+    expect(pay).not.toHaveBeenCalled();
+    const r = await execute(plan, bank, { queue, now: "2026-11-05" }); // Day 4: payroll
     expect(pay.mock.calls.map(([o]) => o.id)).toEqual(["ob_payroll"]);
-    expect(r.outcomes.filter((o) => o.status === "recorded").map((o) => o.decision.action)).toEqual(["defer", "defer"]);
-    const usd = (await bank.getBalances()).find((b) => b.currency === "USD")!;
-    expect(usd.available).toBe(200_000); // exactly the reserve floor
-
+    expect(convert).toHaveBeenCalledTimes(1);
     const payroll = r.audit.find((a) => a.basedOn.obligationIds.includes("ob_payroll"))!;
     expect(payroll).toMatchObject({ executed: true, executionRef: "pay_ob_payroll" });
-    expect(r.audit.find((a) => a.basedOn.obligationIds.includes("ob_supplier"))!.executed).toBe(false);
+    expect((await bank.getBalances()).find((b) => b.currency === "USD")!.available).toBe(506_800);
   });
 
   it("never sends an escalation to the bank", async () => {
-    const { bank, pay } = spiedBank();
+    const { bank, pay } = spied();
     const queue = new EscalationQueue();
-    const r = await execute(goodPlan(), bank, engine, { queue });
-    const paid = pay.mock.calls.map(([o]) => o.id);
-    expect(paid).not.toContain("ob_supplier");
-    expect(paid).not.toContain("ob_legal");
-    expect(queue.list("pending").map((e) => e.decision.obligationId).sort()).toEqual(["ob_legal", "ob_supplier"]);
-    expect(r.escalations).toHaveLength(2);
+    const r = await execute(goodPlan(), bank, { queue, executeAll: true });
+    expect(pay.mock.calls.map(([o]) => o.id)).not.toContain("ob_supplier");
+    expect(queue.list("pending").map((e) => e.decision.obligationId)).toEqual(["ob_supplier"]);
+    expect(r.items.find((i) => i.decision.action === "escalate")!.status).toBe("awaiting_human");
   });
 
-  it("executing twice never pays or converts twice", async () => {
-    const { bank, pay, convert } = spiedBank();
+  it("executing the same plan twice, even at once, never pays or converts twice", async () => {
+    const { bank, pay, convert } = spied(new MockBank({ ...s, balances: [{ accountId: "acc_usd", currency: "USD", available: 5_000_000 }, { accountId: "acc_eur", currency: "EUR", available: 1_400_000 }] }));
     const queue = new EscalationQueue();
     const plan = goodPlan();
-    const [a, b] = await Promise.all([execute(plan, bank, engine, { queue }), execute(plan, bank, engine, { queue })]);
-    const c = await execute(plan, bank, engine, { queue });
-    expect(pay).toHaveBeenCalledTimes(1);
+    await Promise.all([execute(plan, bank, { queue, executeAll: true }), execute(plan, bank, { queue, executeAll: true })]);
+    await execute(plan, bank, { queue, executeAll: true });
     expect(convert).toHaveBeenCalledTimes(1);
-    expect([a.replayed, b.replayed].sort()).toEqual([false, true]);
-    expect(c.replayed).toBe(true);
-    expect(queue.list()).toHaveLength(2);
+    expect(pay.mock.calls.map(([o]) => o.id).sort()).toEqual(["ob_payroll", "ob_rent", "ob_tax"]);
+    expect(queue.list()).toHaveLength(1);
   });
 
-  it("rejects a quote whose spread exceeds policy and pays nothing that depended on it", async () => {
+  it("rejects a quote above the spread limit and pays nothing that depended on it", async () => {
     class WideSpreadBank extends MockBank {
       async quoteFx(from: Currency, to: Currency, sellAmount: number): Promise<FxQuote> {
         return { ...(await super.quoteFx(from, to, sellAmount)), spreadBps: 150 };
       }
     }
-    const { bank, pay, convert } = spiedBank(new WideSpreadBank());
-    const r = await execute(goodPlan(), bank, engine, { queue: new EscalationQueue() });
-    expect(r.ok).toBe(false);
+    const { bank, pay, convert } = spied(new WideSpreadBank());
+    const r = await execute(goodPlan(), bank, { queue: new EscalationQueue(), executeAll: true });
     expect(convert).not.toHaveBeenCalled();
     expect(pay).not.toHaveBeenCalled();
-    const fx = r.outcomes.find((o) => o.decision.action === "convert")!;
-    expect(fx).toMatchObject({ status: "rejected" });
-    expect(fx.error).toMatch(/150 bps exceeds policy.maxFxSpreadBps 80/);
-    expect(r.outcomes.find((o) => o.decision.action === "fund")!.status).toBe("skipped");
+    const fx = r.items.find((i) => i.decision.action === "convert")!;
+    expect(fx.status).toBe("rejected_spread");
+    expect(fx.error).toMatch(/150 bps is above your limit of 80 bps/);
+    expect(r.items.filter((i) => i.decision.action === "fund").every((i) => i.status === "skipped")).toBe(true);
   });
 });
 
 describe("EscalationQueue", () => {
-  it("approving pays the obligation exactly once", async () => {
-    const { bank, pay } = spiedBank();
+  const escalation = { action: "escalate" as const, obligationId: "ob_saas", question: "Pay SaaS Stack now?", reason: "test" };
+
+  it("approve pays exactly once, even if called twice", async () => {
+    const { bank, pay } = spied();
     const queue = new EscalationQueue();
-    const saas = s.obligations.find((o) => o.id === "ob_saas")!;
-    const e = queue.add("plan_x", 0, { action: "escalate", obligationId: "ob_saas", question: "Pay ob_saas now?", reason: "test" }, saas);
-    expect(queue.add("plan_x", 0, { action: "escalate", obligationId: "ob_saas", question: "dup", reason: "dup" }, saas).id).toBe(e.id);
-    const [first, second] = await Promise.all([queue.approve(e.id, bank), queue.approve(e.id, bank)]);
-    const third = await queue.approve(e.id, bank);
+    const e = queue.add("plan_x", escalation);
+    expect(queue.add("plan_x", escalation).id).toBe(e.id);
+    const [a, b] = await Promise.all([queue.approve(e.id, bank), queue.approve(e.id, bank)]);
+    const c = await queue.approve(e.id, bank);
     expect(pay).toHaveBeenCalledTimes(1);
-    expect([first, second].filter((r) => r.execution?.ok)).toHaveLength(1);
-    expect(third.error).toMatch(/already approved/);
+    expect(a.execution?.ok).toBe(true);
+    expect(b.error).toMatch(/already approved/);
+    expect(c.error).toMatch(/already approved/);
     expect(queue.get(e.id)!.status).toBe("approved");
-    expect(queue.list()).toHaveLength(1);
   });
 
-  it("rejecting pays nothing", async () => {
-    const { bank, pay } = spiedBank();
+  it("reject never touches the bank", async () => {
+    const { bank, pay } = spied();
+    const getState = vi.spyOn(bank, "getBusinessState");
     const queue = new EscalationQueue();
-    await execute(goodPlan(), bank, engine, { queue });
-    pay.mockClear();
-    const legal = queue.list().find((e) => e.decision.obligationId === "ob_legal")!;
-    expect(queue.reject(legal.id).escalation.status).toBe("rejected");
-    expect((await queue.approve(legal.id, bank)).error).toMatch(/already rejected/);
+    const e = queue.add("plan_x", escalation);
+    expect(queue.reject(e.id).escalation.status).toBe("rejected");
+    expect((await queue.approve(e.id, bank)).error).toMatch(/already rejected/);
     expect(pay).not.toHaveBeenCalled();
+    expect(getState).not.toHaveBeenCalled();
   });
 });

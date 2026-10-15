@@ -2,11 +2,11 @@ import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { Agent, AgentInput, Engine } from "@/contracts/interfaces";
 import type { BusinessState, Decision, Plan } from "@/contracts/types";
-import { addDays } from "./format";
+import { addDays, effectiveDate } from "./format";
 import { applyUserNote } from "./note";
 import { SUBMIT_TOOL, SYSTEM_PROMPT, userMessage, type PromptContext } from "./prompt";
-import { planWithRules, type PlanIdentity } from "./rules";
-import { createSimulator, SIM_HORIZON_DAYS, type Simulator } from "./simulator";
+import { explainer, newPlanId, overLimit, planWithRules, PLAN_HORIZON_DAYS, resultingForecast, type PlanIdentity } from "./rules";
+import { createSimulator, type Simulator } from "./simulator";
 
 export const DEFAULT_MODEL = "claude-sonnet-5-5";
 
@@ -26,6 +26,7 @@ const rawDecision = z.object({
   to: currency.nullable(),
   sellAmount: z.number().int().positive().nullable(),
   newDate: isoDate.nullable(),
+  executeOn: isoDate.nullable(),
   question: z.string().min(1).nullable(),
   reason: z.string().min(1),
 });
@@ -46,20 +47,20 @@ const decisionSchema = rawDecision.transform((d, ctx): Decision => {
       need("from");
       need("to");
       need("sellAmount");
-      return { action: "convert", from: d.from ?? "USD", to: d.to ?? "USD", sellAmount: d.sellAmount ?? 0, reason: d.reason };
+      return { action: "convert", from: d.from ?? "USD", to: d.to ?? "USD", sellAmount: d.sellAmount ?? 0, ...(d.executeOn ? { executeOn: d.executeOn } : {}), reason: d.reason };
     case "escalate":
       need("question");
       return { action: "escalate", ...(d.obligationId ? { obligationId: d.obligationId } : {}), question: d.question ?? "", reason: d.reason };
   }
 });
 
-export const submitPlanSchema = z.object({ summary: z.string().min(1), decisions: z.array(decisionSchema).min(1) });
+export const submitPlanSchema = z.object({ summary: z.string().min(1), decisions: z.array(decisionSchema) });
 
 const nullable = (type: string) => ({ type: [type, "null"] });
 export const submitPlanTool: Anthropic.Tool = {
   name: SUBMIT_TOOL,
   description:
-    "Submit the treasury plan: one decision per obligation in the forecast horizon, plus any conversions, and a short summary for the business owner.",
+    "Submit the treasury plan: at most one decision per obligation (no decision = paid as scheduled), plus any conversions, and a 1-2 sentence summary for the business owner.",
   strict: true,
   input_schema: {
     type: "object",
@@ -72,7 +73,7 @@ export const submitPlanTool: Anthropic.Tool = {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["action", "obligationId", "from", "to", "sellAmount", "newDate", "question", "reason"],
+          required: ["action", "obligationId", "from", "to", "sellAmount", "newDate", "executeOn", "question", "reason"],
           properties: {
             action: { type: "string", enum: ["fund", "convert", "defer", "escalate"] },
             obligationId: { ...nullable("string"), description: "Required for fund/defer, optional for escalate, null for convert." },
@@ -80,8 +81,9 @@ export const submitPlanTool: Anthropic.Tool = {
             to: { ...nullable("string"), description: "convert only: currency to buy." },
             sellAmount: { ...nullable("integer"), description: "convert only: minor units of `from`. Recomputed by the engine." },
             newDate: { ...nullable("string"), description: "defer only: YYYY-MM-DD, after dueDate and no later than deferrableUntil." },
+            executeOn: { ...nullable("string"), description: "convert only: YYYY-MM-DD, the day before the money is first needed." },
             question: { ...nullable("string"), description: "escalate only: what the human must decide." },
-            reason: { type: "string", description: "Plain English, citing the obligation id, balance, inflow id or policy rule." },
+            reason: { type: "string", description: "One plain-English sentence naming the payee and citing real figures. No ids." },
           },
         },
       },
@@ -116,7 +118,7 @@ export class ClaudeAgent implements Agent {
 
   async propose(input: AgentInput): Promise<Plan> {
     const reference = planWithRules(this.engine, input, this.options);
-    const horizon = Math.max(input.forecast.horizonDays, SIM_HORIZON_DAYS);
+    const horizon = PLAN_HORIZON_DAYS;
     const note = applyUserNote(input.state, input.userNote);
     const state = note.state;
     const forecast = note.adjustments.length > 0 ? this.engine.forecast(state, horizon) : input.forecast;
@@ -127,7 +129,6 @@ export class ClaudeAgent implements Agent {
       sim,
       userNote: input.userNote,
       noteAdjustments: note.adjustments,
-      noteUnparsed: note.unparsed,
       referencePlan: reference.decisions,
     };
 
@@ -161,18 +162,18 @@ export class ClaudeAgent implements Agent {
         const parsed = submitPlanSchema.safeParse(toolUse.input);
         if (!parsed.success) problems = parsed.error.issues.map((i) => `${i.path.join(".") || "input"}: ${i.message}`);
         else {
-          decisions = this.normalise(parsed.data.decisions, sim);
+          decisions = this.normalise(state, parsed.data.decisions, sim);
           summary = parsed.data.summary;
           problems = this.check(state, decisions, sim, horizon);
         }
       }
       if (problems.length === 0) {
         return {
-          id: this.options.newId?.() ?? `plan_${crypto.randomUUID().slice(0, 8)}`,
+          id: this.options.newId?.() ?? newPlanId(),
           createdAt: (this.options.now?.() ?? new Date()).toISOString(),
           decisions,
           summary,
-          resultingForecast: this.engine.forecast(this.engine.applyDecisions(state, decisions), horizon),
+          resultingForecast: resultingForecast(this.engine, state, decisions),
         };
       }
 
@@ -189,10 +190,13 @@ export class ClaudeAgent implements Agent {
     return reference;
   }
 
-  /** Conversion amounts are the engine's job: replace the model's converts with the minimal deterministic ones. */
-  private normalise(decisions: Decision[], sim: Simulator): Decision[] {
+  /** Conversion amounts are the engine's job: replace the model's converts with the deterministic ones and their reasons. */
+  private normalise(state: BusinessState, decisions: Decision[], sim: Simulator): Decision[] {
     const rest = decisions.filter((d) => d.action !== "convert");
-    return [...sim.planConversions(rest), ...rest];
+    const converts = sim.planConversions(rest);
+    const all = [...converts, ...rest];
+    const explain = explainer(this.engine, state, all, sim);
+    return all.map((d) => (d.action === "convert" ? { ...d, reason: explain.reason(d) } : d));
   }
 
   private check(state: BusinessState, decisions: Decision[], sim: Simulator, horizon: number): string[] {
@@ -202,27 +206,23 @@ export class ClaudeAgent implements Agent {
     for (const d of decisions) if ("obligationId" in d && d.obligationId) decided.set(d.obligationId, d);
 
     for (const o of state.obligations) {
-      const due = o.dueDate < state.asOf ? state.asOf : o.dueDate;
       const d = decided.get(o.id);
-      if (!d && due <= lastDay) problems.push(`${o.id} has no decision; give exactly one`);
-      if (o.needsReview && d && d.action !== "escalate") problems.push(`${o.id} has needsReview and must be escalated`);
-      if (o.category === "payroll" && d?.action === "defer") problems.push(`${o.id} is payroll and must never be deferred`);
+      const inHorizon = effectiveDate(o.dueDate, state.asOf) <= lastDay;
+      if (o.needsReview && inHorizon && d?.action !== "escalate") problems.push(`${o.id} (${o.payee}) has needsReview and must be escalated`);
+      if (o.category === "payroll" && d?.action === "defer") problems.push(`${o.id} (${o.payee}) is payroll and must never be deferred`);
+      if (inHorizon && !d && overLimit(state, o)) problems.push(`${o.id} (${o.payee}) is above policy.escalateAbove and must be escalated`);
+      if (d && d.action !== "convert" && !d.reason.toLowerCase().includes(o.payee.toLowerCase())) problems.push(`the reason for ${d.action} ${o.id} must name the payee "${o.payee}"`);
     }
 
-    for (const d of decisions) {
-      if (d.action !== "convert" && "obligationId" in d && d.obligationId && !d.reason.includes(d.obligationId)) {
-        problems.push(`the reason for ${d.action} ${d.obligationId} must cite ${d.obligationId}`);
-      }
-    }
-
-    // What-if check on each payment decision, with every other decision in place.
+    // What-if check: a priority 3-or-lower payment that is only safe because of an uncertain inflow must be escalated.
     if (problems.length === 0) {
-      decisions.forEach((d, i) => {
-        if (d.action !== "fund" && d.action !== "defer") return;
-        const others = decisions.filter((_, j) => j !== i);
-        const r = sim.simulate(others, d);
-        for (const risk of r.risks) problems.push(`${d.action} ${d.obligationId} is unsafe: ${risk.message}`);
-      });
+      for (const o of state.obligations) {
+        const d = decided.get(o.id);
+        if (o.priority > 3 || (d && d.action !== "fund") || effectiveDate(o.dueDate, state.asOf) > lastDay) continue;
+        const others = decisions.filter((x) => !("obligationId" in x && x.obligationId === o.id));
+        const r = sim.simulate(others, { action: "fund", obligationId: o.id, reason: "" }, { mode: "plan" });
+        for (const risk of r.risks) problems.push(`paying ${o.id} (${o.payee}) is unsafe: ${risk.message}`);
+      }
     }
     return [...new Set(problems)];
   }
