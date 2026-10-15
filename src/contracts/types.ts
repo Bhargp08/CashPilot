@@ -52,6 +52,22 @@ export interface Policy {
   maxFxSpreadBps: number; // refuse conversions with worse spread than this
 }
 
+export type AssetKind = "savings" | "treasuries" | "brokerage" | "roth_ira";
+
+/** Money the owner holds outside the operating accounts. Read-only: CashPilot can only propose moving it. */
+export interface Asset {
+  id: string;
+  name: string;
+  kind: AssetKind;
+  value: number; // minor units
+  currency: Currency;
+  daysToCash: number; // business-day estimate until it lands in the operating account
+  costBps: number; // estimated cost (fees, tax drag, penalty) on the amount moved
+  freeAmount?: number; // minor units movable at no cost (e.g. Roth contributions)
+  restricted?: boolean; // retirement-style: last resort, always needs the owner's approval
+  costNote: string; // plain-English explanation of the cost
+}
+
 export interface BusinessState {
   asOf: IsoDate;
   baseCurrency: Currency;
@@ -60,6 +76,7 @@ export interface BusinessState {
   inflows: Inflow[];
   policy: Policy;
   fxRates: FxRate[]; // indicative rates used by the deterministic forecast
+  otherAssets?: Asset[]; // optional: savings, investments, retirement
 }
 
 export interface FxRate {
@@ -108,6 +125,7 @@ export type Decision =
       from: Currency;
       to: Currency;
       sellAmount: number; // minor units of `from`
+      executeOn?: IsoDate; // defaults to the as-of date; a later date schedules the conversion
       reason: string;
     }
   | { action: "defer"; obligationId: string; newDate: IsoDate; reason: string }
@@ -149,4 +167,30 @@ export interface Escalation {
   decision: Extract<Decision, { action: "escalate" }>;
   status: EscalationStatus;
   resolvedAt?: string;
+}
+
+// ---- Funding model (deterministic, src/engine/funding.ts) ----
+
+export interface FundingOption {
+  assetId: string;
+  name: string;
+  kind: AssetKind;
+  amount: number; // minor units, in the operating currency
+  cost: number; // minor units
+  netArriving: number; // amount - cost, what lands in the account
+  arrivesBy: IsoDate;
+  inTime: boolean; // lands on or before the date the money is needed
+  coversNeed: boolean; // this source alone covers the whole need
+  restricted: boolean;
+  costNote: string;
+}
+
+export interface FundingAnalysis {
+  currency: Currency;
+  need: number;
+  needBy: IsoDate;
+  options: FundingOption[]; // each source on its own, ranked best first
+  mix: FundingOption[]; // cheapest combination that closes the need
+  mixCost: number;
+  mixCoversNeed: boolean;
 }

@@ -3,13 +3,18 @@ import { convertAmount } from "./util";
 
 /**
  * Semantics: fund = paid on its due date (no change to the schedule); defer = moves the due date;
- * convert = executes on the as-of date at the indicative rate; escalate = removed from the plan's
+ * convert = executes on `executeOn` (default: the as-of date) at the indicative rate; escalate = removed from the plan's
  * committed outflows until a human decides (the human's choice triggers a re-plan).
  */
 export function applyDecisions(state: BusinessState, decisions: Decision[]): BusinessState {
   const next: BusinessState = structuredClone(state);
   for (const d of decisions) {
-    if (d.action === "convert") {
+    if (d.action === "convert" && d.executeOn && d.executeOn > state.asOf) {
+      const n = next.inflows.length + next.obligations.length;
+      const buy = convertAmount(state, d.sellAmount, d.from, d.to);
+      next.obligations.push({ id: `conv_out_${n}`, payee: "Currency conversion", category: "other", amount: d.sellAmount, currency: d.from, dueDate: d.executeOn, priority: 5 });
+      next.inflows.push({ id: `conv_in_${n}`, payer: "Currency conversion", amount: buy, currency: d.to, expectedDate: d.executeOn, confidence: 1 });
+    } else if (d.action === "convert") {
       const from = next.balances.find((b) => b.currency === d.from);
       let to = next.balances.find((b) => b.currency === d.to);
       if (!from) continue;

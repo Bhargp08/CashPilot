@@ -6,3 +6,4 @@ import { validate } from "./validate";
 
 export const engine: Engine = { forecast, applyDecisions, validate, buildAudit };
 export { forecast, applyDecisions, validate, buildAudit };
+export { fundingOptions, neededFunding, transferInflow, costFor } from "./funding";
