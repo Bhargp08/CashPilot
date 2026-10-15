@@ -125,6 +125,7 @@ export type Decision =
       from: Currency;
       to: Currency;
       sellAmount: number; // minor units of `from`
+      executeOn?: IsoDate; // defaults to the as-of date; a later date schedules the conversion
       reason: string;
     }
   | { action: "defer"; obligationId: string; newDate: IsoDate; reason: string }

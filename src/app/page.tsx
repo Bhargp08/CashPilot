@@ -1,10 +1,9 @@
 import { createBank } from "@/bank";
-import Dashboard from "./components/Dashboard";
-import { buildDemoPlan } from "./lib/demoPlan";
+import AppShell from "./components/AppShell";
 
 export const dynamic = "force-dynamic";
 
 export default async function Page() {
   const state = await createBank().getBusinessState();
-  return <Dashboard state={state} plan={buildDemoPlan(state)} />;
+  return <AppShell state={state} />;
 }
